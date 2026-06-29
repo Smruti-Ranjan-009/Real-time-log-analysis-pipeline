@@ -1,0 +1,12 @@
+# monitoring/grafana/provisioning/dashboards/rtla.yml
+apiVersion: 1
+
+providers:
+  - name:            "RTLA Dashboards"
+    orgId:           1
+    folder:          "RTLA"
+    type:            file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

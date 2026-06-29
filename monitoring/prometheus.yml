@@ -1,0 +1,33 @@
+# monitoring/prometheus.yml
+# ──────────────────────────────────────────────────────────────────────────
+# Scrape config for RTLA Phase 3
+# Start with:  docker-compose up -d prometheus grafana
+# UI:          http://localhost:9090
+# ──────────────────────────────────────────────────────────────────────────
+
+global:
+  scrape_interval:     15s   # How often to scrape targets
+  evaluation_interval: 15s   # How often to evaluate rules
+  scrape_timeout:      10s
+
+# ── Alerting rules file (optional — see recording_rules.yml) ──────────────
+rule_files:
+  - "/etc/prometheus/recording_rules.yml"
+  - "/etc/prometheus/alert_rules.yml"
+
+scrape_configs:
+
+  # ── RTLA FastAPI (/metrics on port 8001) ─────────────────────────────
+  - job_name: "rtla_fastapi"
+    static_configs:
+      - targets: ["host.docker.internal:8001"]
+        labels:
+          service: "rtla"
+          phase:   "3"
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  # ── Prometheus self-monitoring ────────────────────────────────────────
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

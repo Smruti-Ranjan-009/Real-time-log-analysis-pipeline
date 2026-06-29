@@ -1,6 +1,9 @@
 version: '3.8'
 
 services:
+
+  # ── Existing Phase 1 / 2 services (unchanged) ────────────────────────────
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: rtla-zookeeper
@@ -70,6 +73,63 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Phase 3: Prometheus ───────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: rtla-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/recording_rules.yml:/etc/prometheus/recording_rules.yml:ro
+      - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"          # allows hot-reload via POST /-/reload
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets Prometheus reach FastAPI on Windows/Linux
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - kafka
+      - postgres
+
+  # ── Phase 3: Grafana ──────────────────────────────────────────────────────
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: rtla-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: rtla_admin     # change in production
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/rtla_slo.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   qdrant_data:
+  prometheus_data:
+  grafana_data:

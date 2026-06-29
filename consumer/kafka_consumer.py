@@ -1,138 +1,143 @@
 """
-RTLA Phase 1 — Kafka Consumer
-Runs in a background daemon thread.
-Consumes from the rtla-logs topic, parses each message, stores to PostgreSQL.
-Phase 3 will instrument this with Prometheus counters + histograms.
+consumer/kafka_consumer.py  (Phase 3 — instrumented)
+─────────────────────────────────────────────────────
+Measures:
+  • kafka stage   – time from message produce timestamp → consumer poll receipt
+  • delivery stage – time to write parsed log to PostgreSQL
 """
 
+import json
 import logging
-import os
 import threading
+import time
 from typing import Optional
 
-from kafka import KafkaConsumer
-from kafka.errors import NoBrokersAvailable, KafkaError
-from dotenv import load_dotenv
+from confluent_kafka import Consumer, KafkaError, KafkaException
 
-from .parser import parse_log
-from .database import insert_log
+from consumer.database import insert_log
+from consumer.parser import parse_log
+from monitoring import (
+    logs_ingested_total,
+    logs_parsed_total,
+    parse_errors_total,
+    kafka_consumer_lag,
+    measure_stage,
+)
+from monitoring.metrics import stage_latency, slo_violations_total, SLO_BUDGETS_S
 
-load_dotenv()
-logger = logging.getLogger("rtla.kafka_consumer")
+log = logging.getLogger("rtla.consumer")
 
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC", "rtla-logs")
-KAFKA_GROUP     = os.getenv("KAFKA_GROUP_ID", "rtla-consumer-group")
-
-_stop_event:        threading.Event         = threading.Event()
-_consumer_thread:   Optional[threading.Thread] = None
-
-# Simple in-memory counters — Phase 3 will promote these to Prometheus
-_counters = {
-    "received":   0,
-    "parsed_ok":  0,
-    "parse_fail": 0,
-    "db_error":   0,
-}
+TOPIC = "rtla-logs"
+BOOTSTRAP = "localhost:9092"
+GROUP_ID = "rtla-consumer-group"
 
 
-def get_counters() -> dict:
-    return dict(_counters)
-
-
-# ── Internal loop ─────────────────────────────────────────────────────────────
-
-def _consume_loop() -> None:
-    logger.info(
-        f"Kafka consumer starting — broker={KAFKA_BOOTSTRAP} "
-        f"topic={KAFKA_TOPIC} group={KAFKA_GROUP}"
-    )
-
-    consumer = _create_consumer()
-    if consumer is None:
-        logger.error("Could not create Kafka consumer. Consumer thread exiting.")
-        return
-
-    try:
-        while not _stop_event.is_set():
-            records = consumer.poll(timeout_ms=1000)
-            for tp, messages in records.items():
-                for msg in messages:
-                    if _stop_event.is_set():
-                        break
-
-                    _counters["received"] += 1
-                    raw = msg.value
-
-                    entry = parse_log(raw)
-                    if entry is None:
-                        _counters["parse_fail"] += 1
-                        continue
-
-                    _counters["parsed_ok"] += 1
-
-                    try:
-                        row_id = insert_log(entry)
-                        logger.debug(
-                            f"[{entry['level']}] {entry['service']} → row {row_id} "
-                            f"(parse: {entry['parse_latency_ms']:.2f} ms)"
-                        )
-                    except Exception as db_err:
-                        _counters["db_error"] += 1
-                        logger.error(f"DB insert failed: {db_err}")
-
-    except KafkaError as ke:
-        logger.error(f"Kafka error in consumer loop: {ke}")
-    except Exception as e:
-        logger.exception(f"Unexpected error in consumer loop: {e}")
-    finally:
-        consumer.close()
-        logger.info(
-            f"Kafka consumer stopped. Stats: "
-            f"received={_counters['received']} "
-            f"parsed_ok={_counters['parsed_ok']} "
-            f"db_errors={_counters['db_error']}"
-        )
-
-
-def _create_consumer(retries: int = 10) -> Optional[KafkaConsumer]:
-    for attempt in range(1, retries + 1):
-        try:
-            return KafkaConsumer(
-                KAFKA_TOPIC,
-                bootstrap_servers=KAFKA_BOOTSTRAP,
-                group_id=KAFKA_GROUP,
-                auto_offset_reset="latest",
-                enable_auto_commit=True,
-                value_deserializer=lambda m: m.decode("utf-8", errors="replace"),
-                consumer_timeout_ms=1000,   # allows checking _stop_event
-                session_timeout_ms=30000,
-                heartbeat_interval_ms=10000,
+def _record_kafka_latency(msg) -> None:
+    """
+    Estimate Kafka transit latency using the message timestamp.
+    confluent_kafka returns the broker-assigned timestamp in milliseconds.
+    """
+    ts_type, ts_ms = msg.timestamp()
+    if ts_type in (1, 2) and ts_ms > 0:   # 1=CREATE_TIME, 2=LOG_APPEND_TIME
+        now_ms = time.time() * 1000
+        elapsed_s = (now_ms - ts_ms) / 1000.0
+        # Clamp to sane range (clock skew guard)
+        elapsed_s = max(0.0, min(elapsed_s, 30.0))
+        stage_latency.labels(stage="kafka").observe(elapsed_s)
+        if elapsed_s > SLO_BUDGETS_S["kafka"]:
+            slo_violations_total.labels(stage="kafka").inc()
+            log.warning(
+                "SLO VIOLATION stage=kafka elapsed=%.3fms budget=%.3fms",
+                elapsed_s * 1000,
+                SLO_BUDGETS_S["kafka"] * 1000,
             )
-        except NoBrokersAvailable:
-            import time
-            logger.warning(f"Kafka not reachable — attempt {attempt}/{retries}. Retrying in 3s…")
-            time.sleep(3)
-    return None
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+class RtlaKafkaConsumer:
+    def __init__(self):
+        self._consumer: Optional[Consumer] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self.stats: dict = {
+            "consumed": 0,
+            "parsed": 0,
+            "errors": 0,
+            "slo_violations": 0,
+        }
 
-def start_consumer() -> None:
-    global _consumer_thread
-    _stop_event.clear()
-    _consumer_thread = threading.Thread(
-        target=_consume_loop,
-        name="kafka-consumer",
-        daemon=True,
-    )
-    _consumer_thread.start()
-    logger.info("Kafka consumer thread started.")
+    def start(self):
+        self._consumer = Consumer(
+            {
+                "bootstrap.servers": BOOTSTRAP,
+                "group.id": GROUP_ID,
+                "auto.offset.reset": "latest",
+                "enable.auto.commit": True,
+                "statistics.interval.ms": 5000,   # enables lag reporting
+            }
+        )
+        self._consumer.subscribe([TOPIC])
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        log.info("Kafka consumer started — topic=%s group=%s", TOPIC, GROUP_ID)
 
+    def stop(self):
+        self._running = False
+        if self._consumer:
+            self._consumer.close()
 
-def stop_consumer() -> None:
-    logger.info("Requesting Kafka consumer shutdown…")
-    _stop_event.set()
-    if _consumer_thread and _consumer_thread.is_alive():
-        _consumer_thread.join(timeout=8)
-    logger.info("Kafka consumer thread stopped.")
+    def _poll_loop(self):
+        while self._running:
+            try:
+                msg = self._consumer.poll(timeout=0.1)   # 100 ms poll timeout
+                if msg is None:
+                    continue
+                if msg.error():
+                    if msg.error().code() != KafkaError._PARTITION_EOF:
+                        log.error("Kafka error: %s", msg.error())
+                    continue
+
+                self._handle_message(msg)
+
+            except KafkaException as exc:
+                log.exception("KafkaException in poll loop: %s", exc)
+            except Exception as exc:
+                log.exception("Unexpected error in poll loop: %s", exc)
+
+    def _handle_message(self, msg):
+        # ── kafka transit latency ──────────────────────────────────────────
+        _record_kafka_latency(msg)
+
+        raw: str = msg.value().decode("utf-8", errors="replace")
+        self.stats["consumed"] += 1
+
+        # ── parse stage (instrumented in parser.py via @timed_stage) ──────
+        try:
+            parsed = parse_log(raw)
+        except Exception as exc:
+            log.warning("Parse failed: %s | raw=%s", exc, raw[:120])
+            parse_errors_total.inc()
+            self.stats["errors"] += 1
+            return
+
+        if parsed is None:
+            parse_errors_total.inc()
+            self.stats["errors"] += 1
+            return
+
+        # Increment log level counter
+        level = parsed.get("level", "UNKNOWN").upper()
+        logs_ingested_total.labels(level=level).inc()
+        logs_parsed_total.inc()
+        self.stats["parsed"] += 1
+
+        # ── delivery stage ─────────────────────────────────────────────────
+        with measure_stage("delivery"):
+            try:
+                insert_log(parsed)
+            except Exception as exc:
+                log.error("DB insert failed: %s", exc)
+                self.stats["errors"] += 1
+
+    def get_stats(self) -> dict:
+        return dict(self.stats)

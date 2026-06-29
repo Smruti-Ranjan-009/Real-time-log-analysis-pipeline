@@ -1,0 +1,37 @@
+# monitoring/recording_rules.yml
+# Pre-compute p95/p99 per stage to keep Grafana queries fast.
+
+groups:
+  - name: rtla_latency_recording
+    interval: 15s
+    rules:
+
+      # p95 per stage
+      - record: rtla:stage_latency_p95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (stage, le) (
+              rate(rtla_stage_latency_seconds_bucket[5m])
+            )
+          )
+
+      # p99 per stage
+      - record: rtla:stage_latency_p99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (stage, le) (
+              rate(rtla_stage_latency_seconds_bucket[5m])
+            )
+          )
+
+      # SLO error rate per stage (fraction of requests violating budget)
+      - record: rtla:slo_error_rate
+        expr: |
+          rate(rtla_slo_violations_total[5m])
+          /
+          (rate(rtla_logs_parsed_total[5m]) + 0.001)
+
+      # Total pipeline throughput (logs/sec)
+      - record: rtla:throughput_per_second
+        expr: |
+          sum(rate(rtla_logs_ingested_total[1m]))

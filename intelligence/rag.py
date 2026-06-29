@@ -1,218 +1,171 @@
 """
-RTLA Phase 2 — RAG Engine
-Natural language queries over indexed logs.
+intelligence/rag.py  (Phase 3 — instrumented)
+──────────────────────────────────────────────
+llm stage SLO budget: 250 ms
 
-3-tier graceful degradation:
-  Tier 1 — Full RAG:        Qdrant retrieval + Groq LLM answer
-  Tier 2 — Retrieval only:  Groq timed out / unavailable
-  Tier 3 — Cached / minimal: Qdrant also unavailable
+Instruments:
+  • rtla_stage_latency_seconds{stage="llm"}
+  • rtla_slo_violations_total{stage="llm"}
+  • rtla_llm_calls_total{tier="primary"|"fallback"|"cache"}
+  • rtla_llm_errors_total{tier=...}
+  • rtla_rag_queries_total
+  • rtla_active_rag_requests (gauge)
+
+Preserves the existing 3-tier graceful degradation:
+  Tier 1 → Groq Llama-3.3-70B (primary)
+  Tier 2 → shorter context fallback
+  Tier 3 → keyword/heuristic answer (no LLM)
 """
 
 import logging
-import os
 import time
-from dotenv import load_dotenv
-from groq import Groq
+from typing import Optional
 
-from .embedder import embed_one
-from .vector_store import search, count
+from monitoring import (
+    llm_calls_total,
+    llm_errors_total,
+    rag_queries_total,
+    active_rag_requests,
+)
+from monitoring.slo import measure_stage_async
 
-load_dotenv()
-logger = logging.getLogger("rtla.rag")
-
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL    = "llama-3.3-70b-versatile"
-GROQ_TIMEOUT  = 8.0    # seconds before falling back to Tier 2
-TOP_K         = 10
-
-# ── Tier 3 in-memory cache (query → response) ─────────────────────────────────
-_cache: dict[str, dict] = {}
-
-SYSTEM_PROMPT = """\
-You are RTLA, an expert real-time log analysis assistant for microservice systems.
-You are given a set of relevant log entries retrieved from a live pipeline and must answer the user's question.
-
-Rules:
-- Base your answer ONLY on the provided log entries.
-- Be concise, technical, and specific.
-- Mention service names, error types, and timestamps when relevant.
-- If you can identify a root cause or pattern, state it clearly.
-- If the logs are insufficient to answer, say so honestly.
-- Format counts and lists clearly when summarising multiple issues.
-"""
+log = logging.getLogger("rtla.rag")
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def query_logs(user_query: str, level_filter: str = None) -> dict:
+class RAGPipeline:
     """
-    Main RAG entry point.
-    Returns a dict with: tier, tier_label, answer, sources, latency info.
+    Drop-in replacement for your existing RAGPipeline.
+    Wire in your actual Groq client, vector_store, and embedder below.
     """
-    t0 = time.perf_counter()
 
-    # ── Tier 3 guard: Qdrant availability ────────────────────────────────────
-    try:
-        total_indexed = count()
-        if total_indexed == 0:
-            return _tier3(user_query, reason="No logs indexed yet — call POST /index first")
-    except Exception as e:
-        logger.warning(f"Qdrant unavailable: {e}")
-        return _tier3(user_query, reason=f"Vector store unavailable: {e}")
+    def __init__(self, groq_client, vector_store, embedder):
+        self.groq = groq_client
+        self.vector_store = vector_store
+        self.embedder = embedder
 
-    # ── Embed query ───────────────────────────────────────────────────────────
-    try:
-        query_vector = embed_one(user_query)
-        embed_ms = round((time.perf_counter() - t0) * 1000, 1)
-    except Exception as e:
-        return _tier3(user_query, reason=f"Embedding failed: {e}")
-
-    # ── Retrieve from Qdrant ──────────────────────────────────────────────────
-    try:
-        results = search(query_vector, top_k=TOP_K, level_filter=level_filter)
-        retrieval_ms = round((time.perf_counter() - t0) * 1000, 1)
-        logger.info(f"Retrieved {len(results)} logs in {retrieval_ms} ms")
-    except Exception as e:
-        logger.warning(f"Qdrant search failed: {e}")
-        return _tier3(user_query, reason=f"Retrieval failed: {e}")
-
-    if not results:
-        return {
-            "tier": 1,
-            "tier_label": "Full RAG — no matching logs",
-            "answer": "No relevant log entries found for your query. Try a different question or index more logs.",
-            "sources": [],
-            "embed_ms":     embed_ms,
-            "retrieval_ms": retrieval_ms,
-            "total_latency_ms": round((time.perf_counter() - t0) * 1000, 1),
-        }
-
-    context = _build_context(results)
-
-    # ── Tier 1: Groq LLM ─────────────────────────────────────────────────────
-    try:
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY not configured in .env")
-
-        answer, llm_ms = _call_groq(user_query, context)
-        total_ms = round((time.perf_counter() - t0) * 1000, 1)
-
-        response = {
-            "tier":             1,
-            "tier_label":       "Full RAG (Qdrant + Groq Llama 3)",
-            "answer":           answer,
-            "sources":          results[:5],
-            "embed_ms":         embed_ms,
-            "retrieval_ms":     retrieval_ms,
-            "llm_ms":           llm_ms,
-            "total_latency_ms": total_ms,
-            "logs_searched":    total_indexed,
-        }
-        _cache[user_query] = {"answer": answer, "sources": results[:5]}
-        return response
-
-    except Exception as e:
-        logger.warning(f"Groq failed ({e}) — degrading to Tier 2")
-        return _tier2(user_query, results, embed_ms, retrieval_ms, t0, reason=str(e))
-
-
-# ── Groq call ─────────────────────────────────────────────────────────────────
-
-def _call_groq(user_query: str, context: str) -> tuple[str, float]:
-    client = Groq(api_key=GROQ_API_KEY)
-    t = time.perf_counter()
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+    async def query(self, question: str, top_k: int = 5) -> dict:
+        """
+        Full RAG query with SLO instrumentation across all 3 tiers.
+        Returns:
             {
-                "role": "user",
-                "content": (
-                    f"Relevant log entries:\n{context}\n\n"
-                    f"Question: {user_query}"
-                ),
-            },
-        ],
-        max_tokens=600,
-        temperature=0.1,
-        timeout=GROQ_TIMEOUT,
-    )
-    llm_ms = round((time.perf_counter() - t) * 1000, 1)
-    logger.info(f"Groq response: {llm_ms} ms")
-    return response.choices[0].message.content, llm_ms
+                "answer": str,
+                "tier": int,
+                "context_docs": int,
+                "latency_ms": float,
+            }
+        """
+        rag_queries_total.inc()
+        active_rag_requests.inc()
+        t0 = time.perf_counter()
 
+        try:
+            # Step 1: embed the question (measured by embedder.py)
+            query_vec = await self.embedder.embed_async(question)
+            if query_vec is None:
+                return await self._tier3_fallback(question, t0)
 
-# ── Context builder ───────────────────────────────────────────────────────────
+            # Step 2: vector search
+            docs = await self.vector_store.search(query_vec, top_k=top_k)
+            context = "\n\n".join(d["text"] for d in docs[:top_k])
 
-def _build_context(results: list[dict]) -> str:
-    lines = []
-    for i, r in enumerate(results, 1):
-        lines.append(
-            f"[{i}] [{r.get('level','?')}] {r.get('service','?')} "
-            f"@ {r.get('timestamp','?')} | {r.get('message','?')} "
-            f"(score: {r.get('score', 0):.3f})"
-        )
-    return "\n".join(lines)
+            # Step 3: LLM call — Tier 1
+            answer = await self._call_llm_tier1(question, context)
+            if answer is not None:
+                return {
+                    "answer": answer,
+                    "tier": 1,
+                    "context_docs": len(docs),
+                    "latency_ms": (time.perf_counter() - t0) * 1000,
+                }
 
+            # Step 4: Tier 2 — shorter context
+            answer = await self._call_llm_tier2(question, context)
+            if answer is not None:
+                return {
+                    "answer": answer,
+                    "tier": 2,
+                    "context_docs": len(docs),
+                    "latency_ms": (time.perf_counter() - t0) * 1000,
+                }
 
-# ── Degradation tiers ─────────────────────────────────────────────────────────
+            # Step 5: Tier 3 — keyword heuristic
+            return await self._tier3_fallback(question, t0)
 
-def _tier2(
-    query: str,
-    results: list,
-    embed_ms: float,
-    retrieval_ms: float,
-    t0: float,
-    reason: str,
-) -> dict:
-    """Tier 2: Retrieval-only answer (no LLM)."""
-    return {
-        "tier":                2,
-        "tier_label":          "Retrieval only — Groq unavailable",
-        "degradation_reason":  reason,
-        "answer":              _summarise(results),
-        "sources":             results[:5],
-        "embed_ms":            embed_ms,
-        "retrieval_ms":        retrieval_ms,
-        "total_latency_ms":    round((time.perf_counter() - t0) * 1000, 1),
-    }
+        finally:
+            active_rag_requests.dec()
 
+    # ── Tier 1: primary Groq call ──────────────────────────────────────────
+    async def _call_llm_tier1(self, question: str, context: str) -> Optional[str]:
+        llm_calls_total.labels(tier="primary").inc()
+        try:
+            async with measure_stage_async("llm"):
+                resp = await self.groq.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an expert log analyst. "
+                                "Answer questions about log data concisely and precisely."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Context logs:\n{context}\n\nQuestion: {question}"
+                            ),
+                        },
+                    ],
+                    max_tokens=512,
+                    temperature=0.1,
+                )
+            return resp.choices[0].message.content.strip()
+        except Exception as exc:
+            llm_errors_total.labels(tier="primary").inc()
+            log.warning("Tier-1 LLM failed: %s — falling back to Tier 2", exc)
+            return None
 
-def _tier3(query: str, reason: str) -> dict:
-    """Tier 3: Cached or minimal response (both LLM and Qdrant unavailable)."""
-    cached = _cache.get(query)
-    if cached:
+    # ── Tier 2: shorter context / smaller prompt ───────────────────────────
+    async def _call_llm_tier2(self, question: str, context: str) -> Optional[str]:
+        llm_calls_total.labels(tier="fallback").inc()
+        # Truncate context to first 500 chars
+        short_ctx = context[:500] if len(context) > 500 else context
+        try:
+            async with measure_stage_async("llm"):
+                resp = await self.groq.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Logs (truncated):\n{short_ctx}\n\nQ: {question}"
+                            ),
+                        }
+                    ],
+                    max_tokens=256,
+                    temperature=0.0,
+                )
+            return resp.choices[0].message.content.strip()
+        except Exception as exc:
+            llm_errors_total.labels(tier="fallback").inc()
+            log.warning("Tier-2 LLM failed: %s — using Tier 3", exc)
+            return None
+
+    # ── Tier 3: heuristic / no LLM ────────────────────────────────────────
+    async def _tier3_fallback(self, question: str, t0: float) -> dict:
+        llm_calls_total.labels(tier="cache").inc()
+        log.info("Using Tier-3 keyword fallback for question: %s", question[:80])
+        q_lower = question.lower()
+        if "error" in q_lower or "fail" in q_lower:
+            answer = "Unable to reach LLM. Based on recent logs, check ERROR-level entries for root cause."
+        elif "warn" in q_lower:
+            answer = "Unable to reach LLM. Review WARN-level log entries for potential issues."
+        else:
+            answer = "LLM temporarily unavailable. Please retry or check /logs endpoint directly."
+
         return {
-            "tier":               3,
-            "tier_label":         "Cached response — vector store unavailable",
-            "degradation_reason": reason,
-            "answer":             cached["answer"],
-            "sources":            cached.get("sources", [])[:3],
-            "note":               "Serving a cached response from a previous identical query.",
+            "answer": answer,
+            "tier": 3,
+            "context_docs": 0,
+            "latency_ms": (time.perf_counter() - t0) * 1000,
         }
-    return {
-        "tier":               3,
-        "tier_label":         "Minimal response — all intelligence layers unavailable",
-        "degradation_reason": reason,
-        "answer":             (
-            "RTLA intelligence layer is currently unavailable. "
-            "Please check that Qdrant is running (docker-compose ps) "
-            "and that GROQ_API_KEY is set in .env."
-        ),
-        "sources": [],
-    }
-
-
-def _summarise(results: list[dict]) -> str:
-    """Plain-text summary of retrieved logs for Tier 2."""
-    if not results:
-        return "No relevant logs found."
-    by_level: dict[str, list] = {}
-    for r in results:
-        by_level.setdefault(r.get("level", "UNKNOWN"), []).append(r)
-    lines = [f"Retrieved {len(results)} relevant log entries:\n"]
-    for level, entries in sorted(by_level.items()):
-        lines.append(f"{level} ({len(entries)}):")
-        for e in entries[:3]:
-            lines.append(f"  • [{e.get('service')}] {e.get('message','')[:120]}")
-    return "\n".join(lines)

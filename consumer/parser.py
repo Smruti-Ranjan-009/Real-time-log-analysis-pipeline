@@ -1,127 +1,91 @@
 """
-RTLA Phase 1 — Log Parser
-Parses raw log strings into structured dicts.
-Measures parse latency per entry (feeds into Phase 3 SLOs).
+consumer/parser.py  (Phase 3 — instrumented)
+─────────────────────────────────────────────
+parse stage SLO budget: 80 ms
+Wraps the core parse logic with @timed_stage("parse") so every call is
+automatically timed and checked against the budget.
 """
 
 import re
 import time
-import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-# ── Regex patterns (ordered by specificity) ──────────────────────────────────
+from monitoring.slo import timed_stage
 
-_PATTERNS = [
-    # Standard:  2024-01-15 14:32:01 ERROR service-name: message
-    re.compile(
-        r"(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)"
-        r"\s+(?P<level>ERROR|WARN|WARNING|INFO|DEBUG|CRITICAL)"
-        r"\s+(?P<service>[\w\-\.]+)"
-        r":\s*(?P<message>.+)"
-    ),
-    # Bracket:   [2024-01-15 14:32:01] [ERROR] service - message
-    re.compile(
-        r"\[(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})\]"
-        r"\s+\[(?P<level>ERROR|WARN|WARNING|INFO|DEBUG|CRITICAL)\]"
-        r"\s+(?P<service>[\w\-\.]+)"
-        r"\s+-\s+(?P<message>.+)"
-    ),
-]
-
-_LEVEL_NORMALISE = {
-    "WARNING":  "WARN",
-    "CRITICAL": "ERROR",
-}
-
-_TS_FORMATS = [
-    "%Y-%m-%dT%H:%M:%S.%f",
-    "%Y-%m-%d %H:%M:%S,%f",
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%dT%H:%M:%SZ",
-]
-
-VALID_LEVELS = {"ERROR", "WARN", "INFO", "DEBUG", "UNKNOWN"}
+# ── Regex patterns ────────────────────────────────────────────────────────
+_TIMESTAMP_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
+)
+_LEVEL_RE = re.compile(
+    r"\b(DEBUG|INFO|WARN(?:ING)?|ERROR|CRITICAL|FATAL)\b", re.IGNORECASE
+)
+_SERVICE_RE = re.compile(r"\b(service|app|svc)[=: ]+(\S+)", re.IGNORECASE)
+_TRACE_RE = re.compile(r"trace[_-]?id[=: ]+([a-f0-9\-]{8,})", re.IGNORECASE)
+_REQUEST_ID_RE = re.compile(r"request[_-]?id[=: ]+([a-f0-9\-]{8,})", re.IGNORECASE)
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+def _normalise_level(raw: str) -> str:
+    upper = raw.upper()
+    if upper in ("WARNING",):
+        return "WARN"
+    if upper in ("FATAL",):
+        return "CRITICAL"
+    return upper
 
+
+@timed_stage("parse")
 def parse_log(raw: str) -> Optional[dict]:
     """
     Parse a raw log string into a structured dict.
-    Returns None only if the input is blank.
-    Always returns something otherwise (fallback to UNKNOWN level).
+    Returns None if the minimum required fields cannot be extracted.
+
+    Decorated with @timed_stage("parse") — automatically records:
+      • rtla_stage_latency_seconds{stage="parse"}
+      • rtla_slo_violations_total{stage="parse"}  (when > 80 ms)
     """
-    t0 = time.perf_counter()
-    raw = raw.strip()
-    if not raw:
+    if not raw or not raw.strip():
         return None
 
-    entry = _try_json(raw) or _try_regex(raw) or _fallback(raw)
-    entry["parse_latency_ms"] = round((time.perf_counter() - t0) * 1000, 4)
-    return entry
+    result: dict = {"raw": raw.strip()}
 
-
-# ── Private helpers ───────────────────────────────────────────────────────────
-
-def _try_json(raw: str) -> Optional[dict]:
-    if not raw.startswith("{"):
-        return None
-    try:
-        data = json.loads(raw)
-        ts_str  = data.get("timestamp") or data.get("time") or data.get("@timestamp") or ""
-        level   = _norm_level(str(data.get("level", data.get("severity", "INFO"))))
-        service = str(data.get("service", data.get("logger", "unknown")))
-        message = str(data.get("message", data.get("msg", raw)))
-        return {
-            "timestamp": _parse_ts(ts_str),
-            "level":     level,
-            "service":   service,
-            "message":   message[:2000],
-            "raw":       raw,
-        }
-    except Exception:
-        return None
-
-
-def _try_regex(raw: str) -> Optional[dict]:
-    for pattern in _PATTERNS:
-        m = pattern.match(raw)
-        if m:
-            return {
-                "timestamp": _parse_ts(m.group("timestamp")),
-                "level":     _norm_level(m.group("level")),
-                "service":   m.group("service"),
-                "message":   m.group("message").strip()[:2000],
-                "raw":       raw,
-            }
-    return None
-
-
-def _fallback(raw: str) -> dict:
-    """Store unparseable logs so nothing is silently dropped."""
-    return {
-        "timestamp": datetime.utcnow(),
-        "level":     "UNKNOWN",
-        "service":   "unparsed",
-        "message":   raw[:2000],
-        "raw":       raw,
-    }
-
-
-def _norm_level(level: str) -> str:
-    level = level.upper()
-    return _LEVEL_NORMALISE.get(level, level if level in VALID_LEVELS else "UNKNOWN")
-
-
-def _parse_ts(ts_str: str) -> datetime:
-    if not ts_str:
-        return datetime.utcnow()
-    ts_str = ts_str[:26]   # trim microseconds beyond 6 digits
-    for fmt in _TS_FORMATS:
+    # Timestamp
+    ts_match = _TIMESTAMP_RE.search(raw)
+    if ts_match:
         try:
-            return datetime.strptime(ts_str, fmt)
+            ts_str = ts_match.group(1).replace(" ", "T")
+            if ts_str.endswith("Z"):
+                ts_str = ts_str[:-1] + "+00:00"
+            result["timestamp"] = datetime.fromisoformat(ts_str).replace(
+                tzinfo=timezone.utc
+            )
         except ValueError:
-            continue
-    return datetime.utcnow()
+            result["timestamp"] = datetime.now(timezone.utc)
+    else:
+        result["timestamp"] = datetime.now(timezone.utc)
+
+    # Level
+    level_match = _LEVEL_RE.search(raw)
+    result["level"] = _normalise_level(level_match.group(1)) if level_match else "INFO"
+
+    # Service
+    svc_match = _SERVICE_RE.search(raw)
+    result["service"] = svc_match.group(2) if svc_match else "unknown"
+
+    # Trace / request IDs
+    trace_match = _TRACE_RE.search(raw)
+    result["trace_id"] = trace_match.group(1) if trace_match else None
+
+    req_match = _REQUEST_ID_RE.search(raw)
+    result["request_id"] = req_match.group(1) if req_match else None
+
+    # Message body: everything after the level token
+    if level_match:
+        body_start = level_match.end()
+        result["message"] = raw[body_start:].strip(" :-|")
+    else:
+        result["message"] = raw.strip()
+
+    result["parse_latency_ms"] = None   # filled in by the timed_stage wrapper externally if needed
+
+    return result

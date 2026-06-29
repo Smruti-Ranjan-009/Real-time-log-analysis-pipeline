@@ -10,3 +10,9 @@ pydantic==2.6.1
 sentence-transformers==2.7.0
 qdrant-client==1.9.1
 groq==0.9.0
+
+# requirements_phase3_additions.txt
+# Add these to your existing requirements.txt
+# (prometheus-client is the only mandatory new dependency)
+
+prometheus-client==0.20.0   # Prometheus instrumentation

@@ -1,0 +1,75 @@
+# monitoring/alert_rules.yml
+# Fires alerts when per-stage p95 breaches its SLO budget for 2+ minutes.
+
+groups:
+  - name: rtla_slo_alerts
+    rules:
+
+      - alert: RTLAIngestSLOBreach
+        expr: rtla:stage_latency_p95{stage="ingest"} > 0.050
+        for: 2m
+        labels:
+          severity: warning
+          stage: ingest
+        annotations:
+          summary: "Ingest p95 latency above 50 ms SLO"
+          description: "p95={{ $value | humanizeDuration }} budget=50ms"
+
+      - alert: RTLAKafkaSLOBreach
+        expr: rtla:stage_latency_p95{stage="kafka"} > 0.030
+        for: 2m
+        labels:
+          severity: warning
+          stage: kafka
+        annotations:
+          summary: "Kafka transit p95 latency above 30 ms SLO"
+          description: "p95={{ $value | humanizeDuration }} budget=30ms"
+
+      - alert: RTLAParseSLOBreach
+        expr: rtla:stage_latency_p95{stage="parse"} > 0.080
+        for: 2m
+        labels:
+          severity: warning
+          stage: parse
+        annotations:
+          summary: "Parse p95 latency above 80 ms SLO"
+          description: "p95={{ $value | humanizeDuration }} budget=80ms"
+
+      - alert: RTLAEmbedSLOBreach
+        expr: rtla:stage_latency_p95{stage="embed"} > 0.060
+        for: 2m
+        labels:
+          severity: warning
+          stage: embed
+        annotations:
+          summary: "Embed p95 latency above 60 ms SLO"
+          description: "p95={{ $value | humanizeDuration }} budget=60ms"
+
+      - alert: RTLALLMSLOBreach
+        expr: rtla:stage_latency_p95{stage="llm"} > 0.250
+        for: 2m
+        labels:
+          severity: critical
+          stage: llm
+        annotations:
+          summary: "LLM p95 latency above 250 ms SLO"
+          description: "p95={{ $value | humanizeDuration }} budget=250ms"
+
+      - alert: RTLADeliverySLOBreach
+        expr: rtla:stage_latency_p95{stage="delivery"} > 0.020
+        for: 2m
+        labels:
+          severity: warning
+          stage: delivery
+        annotations:
+          summary: "Delivery p95 latency above 20 ms SLO"
+          description: "p95={{ $value | humanizeDuration }} budget=20ms"
+
+      - alert: RTLAHighErrorRate
+        expr: rtla:slo_error_rate > 0.05
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RTLA SLO error rate above 5%"
+          description: "error_rate={{ $value | humanizePercentage }}"
