@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #0f1117;
+    color: #e2e8f0;
+    font-family: 'Inter', sans-serif;
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #1a1f2e; }
+  ::-webkit-scrollbar-thumb { background: #3a3f4e; border-radius: 3px; }
+}
+
+@layer components {
+  .card {
+    @apply bg-card border border-border rounded-xl p-4;
+  }
+  .badge-error  { @apply bg-red-500/15 text-red-400 px-2 py-0.5 rounded text-xs font-mono font-semibold; }
+  .badge-warn   { @apply bg-amber-500/15 text-amber-400 px-2 py-0.5 rounded text-xs font-mono font-semibold; }
+  .badge-info   { @apply bg-blue-500/15 text-blue-400 px-2 py-0.5 rounded text-xs font-mono font-semibold; }
+  .badge-debug  { @apply bg-slate-500/15 text-slate-400 px-2 py-0.5 rounded text-xs font-mono font-semibold; }
+  .badge-unknown{ @apply bg-purple-500/15 text-purple-400 px-2 py-0.5 rounded text-xs font-mono font-semibold; }
+}
