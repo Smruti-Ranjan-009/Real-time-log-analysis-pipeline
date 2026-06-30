@@ -140,11 +140,25 @@ def index_new_logs(max_logs=200):
 _stop = threading.Event()
 
 def _gen_loop():
+    last_index_at = 0
     while not _stop.is_set():
         insert_log(gen_log())
         if random.random() < 0.01:
             for _ in range(random.randint(5,12)):
                 insert_log({**gen_log(), "level":"ERROR"})
+
+        # Auto-index every ~20 seconds so the demo is always query-ready,
+        # even right after a Space restart with an empty Qdrant store.
+        now = time.time()
+        if now - last_index_at > 20:
+            try:
+                n = index_new_logs(max_logs=300)
+                if n:
+                    logger.info(f"Auto-indexed {n} new logs into Qdrant")
+            except Exception as e:
+                logger.warning(f"Auto-index failed: {e}")
+            last_index_at = now
+
         time.sleep(1/3)
 
 # ── RAG ───────────────────────────────────────────────────────────────────────
@@ -188,6 +202,12 @@ async def lifespan(app):
     # Seed with some initial logs
     for _ in range(50):
         insert_log(gen_log())
+    # Index immediately so the demo is query-ready right after startup
+    try:
+        index_new_logs(max_logs=200)
+        logger.info("Initial index complete on startup")
+    except Exception as e:
+        logger.warning(f"Initial index failed: {e}")
     t = threading.Thread(target=_gen_loop, daemon=True)
     t.start()
     yield
